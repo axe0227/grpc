@@ -35,6 +35,9 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <vector>
+#include <random>
+#include <atomic>
 
 #include <grpc++/grpc++.h>
 
@@ -46,130 +49,232 @@ using grpc::ServerBuilder;
 using grpc::ServerContext;
 using grpc::ServerCompletionQueue;
 using grpc::Status;
+using grpc::StatusCode;
 using hellostreamingworld::HelloRequest;
 using hellostreamingworld::HelloReply;
 using hellostreamingworld::MultiGreeter;
 
-enum class Type { READ = 1, WRITE = 2, CONNECT = 3, FINISH = 4 };
+int g_thread_num = 1;
+int g_cq_num = 1;
+int g_pool = 1;
+int g_port = 50051;
 
-// NOTE: This is a complex example for an asynchronous, bidirectional streaming
-// server. For a simpler example, start with the
-// greeter_server/greeter_async_server first.
+std::atomic<void*>**    g_instance_pool = nullptr;
 
-// Most of the logic is similar to AsyncBidiGreeterClient, so follow that class
-// for detailed comments. The only difference between the server and the client
-// is the (a) concept of 'listening' as well as (b) client 'Finish()' that
-// closes a specific client->server stream (but lets the server handle multiple
-// streams).
-class AsyncBidiGreeterServer {
- public:
-  AsyncBidiGreeterServer() {
-    // In general avoid setting up the server in the main thread (specifically,
-    // in a constructor-like function such as this). We ignore this in the
-    // context of an example.
-    std::string server_address("0.0.0.0:50051");
+class CallDataBase {
+public:
+  CallDataBase(MultiGreeter::AsyncService* service, ServerCompletionQueue* cq)
+   :service_(service), cq_(cq){}
 
-    ServerBuilder builder;
-    builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
-    builder.RegisterService(&service_);
-    cq_ = builder.AddCompletionQueue();
-    server_ = builder.BuildAndStart();
+  virtual void Proceed(bool ok) = 0;
 
-    // This initiates a single stream for a single client. To allow multiple
-    // clients in different threads to connect, simply 'request' from the
-    // different threads. Each stream is independent but can use the same
-    // completion queue/context objects.
-    stream_.reset(
-        new ServerAsyncReaderWriter<HelloReply, HelloRequest>(&context_));
-    service_.RequestSayHello(&context_, stream_.get(), cq_.get(), cq_.get(),
-                             reinterpret_cast<void*>(Type::CONNECT));
-    grpc_thread_.reset(new std::thread([=]() { GrpcThread(); }));
-    std::cout << "Server listening on " << server_address << std::endl;
-  }
+protected:
 
-  void SetResponse(const std::string& response) { response_str_ = response; }
+  // The means of communication with the gRPC runtime for an asynchronous
+  // server.
+  MultiGreeter::AsyncService* service_;
+  // The producer-consumer queue where for asynchronous server notifications.
+  ServerCompletionQueue* cq_;
 
-  ~AsyncBidiGreeterServer() {
-    std::cout << "Shutting down server." << std::endl;
-    server_->Shutdown();
-    // Always shutdown the completion queue after the server.
-    cq_->Shutdown();
-    grpc_thread_->join();
-  }
+  // Context for the rpc, allowing to tweak aspects of it such as the use
+  // of compression, authentication, as well as to send metadata back to the
+  // client.
+  ServerContext ctx_;
 
- private:
-  void AsyncWaitForHelloRequest() {
-    // In the case of the server, we wait for a READ first and then write a
-    // response. A server cannot initiate a connection so the server has to
-    // wait for the client to send a message in order for it to respond back.
-    stream_->Read(&request_, reinterpret_cast<void*>(Type::READ));
-  }
-
-  void AsyncHelloSendResponse() {
-    std::cout << " ** Handling request: " << request_.name() << std::endl;
-    HelloReply response;
-    std::cout << " ** Sending response: " << response_str_ << std::endl;
-    response.set_message(response_str_);
-    stream_->Write(response, reinterpret_cast<void*>(Type::WRITE));
-  }
-
-  void GrpcThread() {
-    while (true) {
-      void* got_tag = nullptr;
-      bool ok = false;
-      if (!cq_->Next(&got_tag, &ok)) {
-        std::cerr << "Client stream closed. Quitting" << std::endl;
-        break;
-      }
-
-      if (ok) {
-        std::cout << std::endl
-                  << "**** Processing completion queue tag " << got_tag
-                  << std::endl;
-        switch (static_cast<Type>(reinterpret_cast<size_t>(got_tag))) {
-          case Type::READ:
-            std::cout << "Read a new message." << std::endl;
-            AsyncHelloSendResponse();
-            break;
-          case Type::WRITE:
-            std::cout << "Sending message (async)." << std::endl;
-            AsyncWaitForHelloRequest();
-            break;
-          case Type::CONNECT:
-            std::cout << "Client connected." << std::endl;
-            AsyncWaitForHelloRequest();
-            break;
-          default:
-            std::cerr << "Unexpected tag " << got_tag << std::endl;
-            GPR_ASSERT(false);
-        }
-      }
-    }
-  }
-
- private:
+  // What we get from the client.
   HelloRequest request_;
-  std::string response_str_ = "Default server response";
-  ServerContext context_;
-  std::unique_ptr<ServerCompletionQueue> cq_;
-  MultiGreeter::AsyncService service_;
-  std::unique_ptr<Server> server_;
-  std::unique_ptr<ServerAsyncReaderWriter<HelloReply, HelloRequest>> stream_;
-  std::unique_ptr<std::thread> grpc_thread_;
+  // What we send back to the client.
+  HelloReply reply_;
+
+
 };
 
-int main(int argc, char** argv) {
-  AsyncBidiGreeterServer server;
+class CallDataBidi : CallDataBase {
 
-  std::string response;
-  while (true) {
-    std::cout << "Enter next set of responses (type quit to end): ";
-    std::cin >> response;
-    if (response == "quit") {
-      break;
-    }
-    server.SetResponse(response);
+ public:
+
+  // Take in the "service" instance (in this case representing an asynchronous
+  // server) and the completion queue "cq" used for asynchronous communication
+  // with the gRPC runtime.
+  CallDataBidi(MultiGreeter::AsyncService* service, ServerCompletionQueue* cq) : CallDataBase(service,cq),rw_(&ctx_){
+    // Invoke the serving logic right away.
+
+    status_ = BidiStatus::CONNECT;
+
+    ctx_.AsyncNotifyWhenDone((void*)this);
+    service_->RequestSayHello(&ctx_, &rw_, cq_, cq_, (void*)this);
   }
+
+  void Proceed(bool ok) {
+
+    std::unique_lock<std::mutex> _wlock(this->m_mutex);
+
+    switch (status_) {
+    case BidiStatus::READ:
+
+        //Meaning client said it wants to end the stream either by a 'writedone' or 'finish' call.
+        if (!ok) {
+            std::cout << "thread:" << std::this_thread::get_id() << " tag:" << this << " CQ returned false." << std::endl;
+            Status _st(StatusCode::OUT_OF_RANGE,"test error msg");
+            rw_.Finish(_st,(void*)this);
+            status_ = BidiStatus::DONE;
+            std::cout << "thread:" << std::this_thread::get_id() << " tag:" << this << " after call Finish(), cancelled:" << this->ctx_.IsCancelled() << std::endl;
+            break;
+        }
+
+        std::cout << "thread:" << std::this_thread::get_id() << " tag:" << this << " Read a new message:" << request_.name() << std::endl;
+
+        reply_.set_message("arthur");
+        rw_.Write(reply_, (void*)this);
+
+        status_ = BidiStatus::WRITE;
+        break;
+
+    case BidiStatus::WRITE:
+        std::cout << "thread:" << std::this_thread::get_id() << " tag:" << this << " Written a message:" << reply_.message() << std::endl;
+        rw_.Read(&request_, (void*)this);
+        status_ = BidiStatus::READ;
+        break;
+
+    case BidiStatus::CONNECT:
+        std::cout << "thread:" << std::this_thread::get_id() << " tag:" << this << " connected:" << std::endl;
+        new CallDataBidi(service_, cq_);
+        rw_.Read(&request_, (void*)this);
+        status_ = BidiStatus::READ;
+        break;
+
+    case BidiStatus::DONE:
+        std::cout << "thread:" << std::this_thread::get_id() << " tag:" << this
+                << " Server done, cancelled:" << this->ctx_.IsCancelled() << std::endl;
+        status_ = BidiStatus::FINISH;
+        break;
+
+    case BidiStatus::FINISH:
+        std::cout << "thread:" << std::this_thread::get_id() <<  "tag:" << this << " Server finish, cancelled:" << this->ctx_.IsCancelled() << std::endl;
+        _wlock.unlock();
+        delete this;
+        break;
+
+    default:
+        std::cerr << "Unexpected tag " << int(status_) << std::endl;
+        assert(false);
+    }
+  }
+
+ private:
+
+  // The means to get back to the client.
+  ServerAsyncReaderWriter<HelloReply,HelloRequest>    rw_;
+
+  // Let's implement a tiny state machine with the following states.
+  enum class BidiStatus { READ = 1, WRITE = 2, CONNECT = 3, DONE = 4, FINISH = 5 };
+  BidiStatus status_;
+
+  std::mutex    m_mutex;
+};
+
+
+class ServerImpl final {
+ public:
+  ~ServerImpl() {
+    server_->Shutdown();
+    // Always shutdown the completion queue after the server.
+    for (const auto& _cq : m_cq)
+        _cq->Shutdown();
+  }
+
+  // There is no shutdown handling in this code.
+  void Run() {
+      std::string server_address("0.0.0.0:" + std::to_string(g_port));
+
+    ServerBuilder builder;
+    // Listen on the given address without any authentication mechanism.
+    builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
+    // Register "service_" as the instance through which we'll communicate with
+    // clients. In this case it corresponds to an *asynchronous* service.
+    builder.RegisterService(&service_);
+    // Get hold of the completion queue used for the asynchronous communication
+    // with the gRPC runtime.
+
+    for (int i = 0; i < g_cq_num; ++i) {
+        //cq_ = builder.AddCompletionQueue();
+        m_cq.emplace_back(builder.AddCompletionQueue());
+    }
+
+    // Finally assemble the server.
+    server_ = builder.BuildAndStart();
+    std::cout << "Server listening on " << server_address << std::endl;
+
+    // Proceed to the server's main loop.
+    std::vector<std::thread*> _vec_threads;
+
+    for (int i = 0; i < g_thread_num; ++i) {
+        int _cq_idx = i % g_cq_num;
+        for (int j = 0; j < g_pool; ++j) {
+            // new CallDataUnary(&service_, m_cq[_cq_idx].get());
+            new CallDataBidi(&service_, m_cq[_cq_idx].get());
+        }
+
+        _vec_threads.emplace_back(new std::thread(&ServerImpl::HandleRpcs, this, _cq_idx));
+    }
+
+    std::cout << g_thread_num << " working aysnc threads spawned" << std::endl;
+
+    for (const auto& _t : _vec_threads)
+        _t->join();
+  }
+
+ private:
+  // Class encompasing the state and logic needed to serve a request.
+
+  // This can be run in multiple threads if needed.
+  void HandleRpcs(int cq_idx) {
+    // Spawn a new CallDataUnary instance to serve new clients.
+    void* tag;  // uniquely identifies a request.
+    bool ok;
+    while (true) {
+      // Block waiting to read the next event from the completion queue. The
+      // event is uniquely identified by its tag, which in this case is the
+      // memory address of a CallDataUnary instance.
+      // The return value of Next should always be checked. This return value
+      // tells us whether there is any kind of event or cq_ is shutting down.
+      //GPR_ASSERT(cq_->Next(&tag, &ok));
+      GPR_ASSERT(m_cq[cq_idx]->Next(&tag, &ok));
+
+      CallDataBase* _p_ins = (CallDataBase*)tag;
+      _p_ins->Proceed(ok);
+    }
+  }
+
+  std::vector<std::unique_ptr<ServerCompletionQueue>>  m_cq;
+
+  MultiGreeter::AsyncService service_;
+  std::unique_ptr<Server> server_;
+};
+
+const char* ParseCmdPara( char* argv,const char* para) {
+    auto p_target = std::strstr(argv,para);
+    if (p_target == nullptr) {
+        printf("para error argv[%s] should be %s \n",argv,para);
+        return nullptr;
+    }
+    p_target += std::strlen(para);
+    return p_target;
+}
+
+int main(int argc, char** argv) {
+  // if (argc != 5) {
+  //     std::cout << "Usage:./program --thread=xx --cq=xx --pool=xx --port=xx";
+  //     return 0;
+  // }
+
+  // g_thread_num = std::atoi(ParseCmdPara(argv[1],"--thread="));
+  // g_cq_num = std::atoi(ParseCmdPara(argv[2],"--cq="));
+  // g_pool = std::atoi(ParseCmdPara(argv[3],"--pool="));
+  // g_port = std::atoi(ParseCmdPara(argv[4],"--port="));
+
+  ServerImpl server;
+  server.Run();
 
   return 0;
 }
