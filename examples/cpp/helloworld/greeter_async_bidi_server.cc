@@ -40,7 +40,6 @@
 #include <atomic>
 
 #include <grpc++/grpc++.h>
-
 #include "hellostreamingworld.grpc.pb.h"
 
 using grpc::Server;
@@ -85,8 +84,6 @@ protected:
   HelloRequest request_;
   // What we send back to the client.
   HelloReply reply_;
-
-
 };
 
 class CallDataBidi : CallDataBase {
@@ -96,7 +93,8 @@ class CallDataBidi : CallDataBase {
   // Take in the "service" instance (in this case representing an asynchronous
   // server) and the completion queue "cq" used for asynchronous communication
   // with the gRPC runtime.
-  CallDataBidi(MultiGreeter::AsyncService* service, ServerCompletionQueue* cq) : CallDataBase(service,cq),rw_(&ctx_){
+  CallDataBidi(MultiGreeter::AsyncService* service, ServerCompletionQueue* cq)
+   :CallDataBase(service,cq),rw_(&ctx_){
     // Invoke the serving logic right away.
 
     status_ = BidiStatus::CONNECT;
@@ -116,6 +114,8 @@ class CallDataBidi : CallDataBase {
         if (!ok) {
             std::cout << "thread:" << std::this_thread::get_id() << " tag:" << this << " CQ returned false." << std::endl;
             Status _st(StatusCode::OUT_OF_RANGE,"test error msg");
+            rw_.Write(reply_, (void*)this);
+
             rw_.Finish(_st,(void*)this);
             status_ = BidiStatus::DONE;
             std::cout << "thread:" << std::this_thread::get_id() << " tag:" << this << " after call Finish(), cancelled:" << this->ctx_.IsCancelled() << std::endl;
@@ -125,15 +125,15 @@ class CallDataBidi : CallDataBase {
         std::cout << "thread:" << std::this_thread::get_id() << " tag:" << this << " Read a new message:" << request_.name() << std::endl;
 
         reply_.set_message("arthur");
-        rw_.Write(reply_, (void*)this);
+        rw_.Read(&request_, (void*)this);
 
-        status_ = BidiStatus::WRITE;
+        status_ = BidiStatus::READ;
         break;
 
     case BidiStatus::WRITE:
         std::cout << "thread:" << std::this_thread::get_id() << " tag:" << this << " Written a message:" << reply_.message() << std::endl;
         rw_.Read(&request_, (void*)this);
-        status_ = BidiStatus::READ;
+        status_ = BidiStatus::WRITE;
         break;
 
     case BidiStatus::CONNECT:
@@ -164,7 +164,7 @@ class CallDataBidi : CallDataBase {
  private:
 
   // The means to get back to the client.
-  ServerAsyncReaderWriter<HelloReply,HelloRequest>    rw_;
+  ServerAsyncReaderWriter<HelloReply, HelloRequest>  rw_;
 
   // Let's implement a tiny state machine with the following states.
   enum class BidiStatus { READ = 1, WRITE = 2, CONNECT = 3, DONE = 4, FINISH = 5 };
@@ -185,7 +185,7 @@ class ServerImpl final {
 
   // There is no shutdown handling in this code.
   void Run() {
-      std::string server_address("0.0.0.0:" + std::to_string(g_port));
+    std::string server_address("0.0.0.0:" + std::to_string(g_port));
 
     ServerBuilder builder;
     // Listen on the given address without any authentication mechanism.

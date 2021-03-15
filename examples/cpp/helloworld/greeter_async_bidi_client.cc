@@ -82,13 +82,15 @@ public:
     // that is notified when the server responds back (or when the stream is
     // closed). Returns false when the stream is requested to be closed.
     bool AsyncSayHello(const std::string& user) {
+        rpc_counter_++;
         if (user == "quit") {
             stream_->WritesDone(reinterpret_cast<void*>(Type::WRITES_DONE));
             return true;
         }
 
+        std::string message = user + std::to_string(rpc_counter_);
         // Data we are sending to the server.
-        request_.set_name(user);
+        request_.set_name(message);
 
         // This is important: You can have at most one write or at most one read
         // at any given time. The throttling is performed by gRPC completion
@@ -139,7 +141,7 @@ private:
                     break;
                 case Type::WRITE:
                     std::cout << "Sent message :" << request_.name() << std::endl;
-                    AsyncHelloRequestNextMessage();
+                    AsyncSayHello("world");
                     break;
                 case Type::CONNECT:
                     std::cout << "Server connected." << std::endl;
@@ -188,15 +190,28 @@ private:
 
     // Finish status when the client is done with the stream.
     grpc::Status finish_status_ = grpc::Status::OK;
+
+    int rpc_counter_ = 0;
 };
 
 int main(int argc, char** argv) {
     AsyncBidiGreeterClient greeter(grpc::CreateChannel(
         "localhost:50051", grpc::InsecureChannelCredentials()));
 
+    // std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+
+    // for(int i = 0; i < 100000; i++){
+
+    // }
+
     std::string text;
+    // for(int i = 0 ; i < 100; ++i){
+    //   text = "hello" + std::to_string(i);
+    //   greeter.AsyncSayHello(text);
+    // }
+
     while (true) {
-        //std::cout << "Enter text (type quit to end): ";
+        std::cout << "Enter text (type quit to end): ";
         std::cin >> text;
 
         // Async RPC call that sends a message and awaits a response.
