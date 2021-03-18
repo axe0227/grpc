@@ -35,6 +35,9 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <chrono>
 
 #include <grpc++/grpc++.h>
 
@@ -68,6 +71,10 @@ public:
             new std::thread(std::bind(&AsyncBidiGreeterClient::GrpcThread, this)));
         stream_ = stub_->AsyncSayHello(&context_, &cq_,
             reinterpret_cast<void*>(Type::CONNECT));
+        
+        // sleep for a while to let the CONNECT request finish and cq received the tag
+        // then we can start doing Write
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
     ~AsyncBidiGreeterClient() {
@@ -82,13 +89,26 @@ public:
     // that is notified when the server responds back (or when the stream is
     // closed). Returns false when the stream is requested to be closed.
     bool AsyncSayHello(const std::string& user) {
-        rpc_counter_++;
-        if (user == "quit") {
-            stream_->WritesDone(reinterpret_cast<void*>(Type::WRITES_DONE));
-            return true;
+
+        rpc_counter_.fetch_add(1);
+        // If it's not ready
+        std::string message = user + std::to_string(rpc_counter_.load());
+        {
+            if(!ready_.load()){
+                // std::cout << "[m] wait : " << message << std::endl;
+                std::unique_lock<std::mutex> lk(mu_);
+                // wait until 
+                cv_.wait_for(lk, std::chrono::milliseconds(100), [&](){return ready_.load();});
+                // std::cout << "[m] Notified \n";
+                ready_.store(false);
+            }
         }
 
-        std::string message = user + std::to_string(rpc_counter_);
+        // if (user == "quit") {
+        //     stream_->WritesDone(reinterpret_cast<void*>(Type::WRITES_DONE));
+        //     return true;
+        // }
+
         // Data we are sending to the server.
         request_.set_name(message);
 
@@ -99,7 +119,15 @@ public:
         // and a single write request queued for the same stream. Writes and reads
         // are independent of each other in terms of ordering/delivery.
         //std::cout << " ** Sending request: " << user << std::endl;
+        // std::cout << "[m] Write \n";
         stream_->Write(request_, reinterpret_cast<void*>(Type::WRITE));
+
+        // Manual unlocking is done before notifying, to avoid waking up
+        // the waiting thread only to block again (see notify_one for details)
+        
+        if(ready_.load()){
+            ready_.store(false);
+        }
         return true;
     }
 
@@ -124,6 +152,7 @@ private:
             // The return value of Next should always be checked. This return value
             // tells us whether there is any kind of event or the cq_ is shutting
             // down.
+
             if (!cq_.Next(&got_tag, &ok)) {
                 std::cerr << "Client stream closed. Quitting" << std::endl;
                 break;
@@ -140,8 +169,15 @@ private:
                     std::cout << "Read a new message:" << response_.message() << std::endl;
                     break;
                 case Type::WRITE:
-                    std::cout << "Sent message :" << request_.name() << std::endl;
-                    AsyncSayHello("world");
+                    // std::cout << "[g] polled :" << request_.name() << std::endl;
+                    // received a tag on the cq, notify the main thread that we can start a new Write
+                    
+                    // if(!ready_.load()){
+                        ready_.store(true);
+                        // std::cout << "[g] Notifying \n";
+                        cv_.notify_one();
+                    // }
+                
                     break;
                 case Type::CONNECT:
                     std::cout << "Server connected." << std::endl;
@@ -157,12 +193,16 @@ private:
                     break;
                 default:
                     std::cerr << "Unexpected tag " << got_tag << std::endl;
-                    assert(false);
+                    // assert(false);
+                    break;
                 }
             }
         }
     }
-
+    // is this the first time we call write
+    std::atomic_bool ready_ {true};
+    std::mutex mu_;
+    std::condition_variable_any cv_;
     // Context for the client. It could be used to convey extra information to
     // the server and/or tweak certain RPC behaviors.
     ClientContext context_;
@@ -191,34 +231,26 @@ private:
     // Finish status when the client is done with the stream.
     grpc::Status finish_status_ = grpc::Status::OK;
 
-    int rpc_counter_ = 0;
+    std::atomic<uint64_t> rpc_counter_{0};
 };
 
 int main(int argc, char** argv) {
     AsyncBidiGreeterClient greeter(grpc::CreateChannel(
         "localhost:50051", grpc::InsecureChannelCredentials()));
 
-    // std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-
-    // for(int i = 0; i < 100000; i++){
-
-    // }
-
-    std::string text;
-    // for(int i = 0 ; i < 100; ++i){
-    //   text = "hello" + std::to_string(i);
-    //   greeter.AsyncSayHello(text);
-    // }
-
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    int num;
     while (true) {
-        std::cout << "Enter text (type quit to end): ";
-        std::cin >> text;
-
+        std::cout << "Enter number of ops (type quit to end): ";
+        std::cin >> num;
         // Async RPC call that sends a message and awaits a response.
-        if (!greeter.AsyncSayHello(text)) {
-            std::cout << "Quitting." << std::endl;
-            break;
+        for(int i = 0; i < num; i++){
+            if(!greeter.AsyncSayHello("hello")){
+                std::cout << "Quitting." << std::endl;
+                break;
+            }
         }
+        
     }
     return 0;
 }

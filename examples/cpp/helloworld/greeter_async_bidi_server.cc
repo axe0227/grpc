@@ -114,7 +114,7 @@ class CallDataBidi : CallDataBase {
         if (!ok) {
             std::cout << "thread:" << std::this_thread::get_id() << " tag:" << this << " CQ returned false." << std::endl;
             Status _st(StatusCode::OUT_OF_RANGE,"test error msg");
-            rw_.Write(reply_, (void*)this);
+            // rw_.Write(reply_, (void*)this);
 
             rw_.Finish(_st,(void*)this);
             status_ = BidiStatus::DONE;
@@ -127,13 +127,13 @@ class CallDataBidi : CallDataBase {
         reply_.set_message("arthur");
         rw_.Read(&request_, (void*)this);
 
-        status_ = BidiStatus::READ;
+        status_ = BidiStatus::WRITE;
         break;
 
     case BidiStatus::WRITE:
         std::cout << "thread:" << std::this_thread::get_id() << " tag:" << this << " Written a message:" << reply_.message() << std::endl;
         rw_.Read(&request_, (void*)this);
-        status_ = BidiStatus::WRITE;
+        status_ = BidiStatus::READ;
         break;
 
     case BidiStatus::CONNECT:
