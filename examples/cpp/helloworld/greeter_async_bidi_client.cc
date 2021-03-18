@@ -92,25 +92,25 @@ public:
 
         rpc_counter_.fetch_add(1);
         // If it's not ready
-        std::string message = user + std::to_string(rpc_counter_.load());
+        // std::string message = user + std::to_string(rpc_counter_.load());
         {
             if(!ready_.load()){
-                // std::cout << "[m] wait : " << message << std::endl;
+                std::cout << "[m] wait : " << user << std::endl;
                 std::unique_lock<std::mutex> lk(mu_);
                 // wait until 
                 cv_.wait_for(lk, std::chrono::milliseconds(100), [&](){return ready_.load();});
-                // std::cout << "[m] Notified \n";
+                std::cout << "[m] Notified \n";
                 ready_.store(false);
             }
         }
 
-        // if (user == "quit") {
+        // if (rpc_counter_ == ) {
         //     stream_->WritesDone(reinterpret_cast<void*>(Type::WRITES_DONE));
         //     return true;
         // }
 
         // Data we are sending to the server.
-        request_.set_name(message);
+        request_.set_name(user);
 
         // This is important: You can have at most one write or at most one read
         // at any given time. The throttling is performed by gRPC completion
@@ -167,15 +167,21 @@ private:
                 switch (static_cast<Type>(reinterpret_cast<long>(got_tag))) {
                 case Type::READ:
                     std::cout << "Read a new message:" << response_.message() << std::endl;
+                        ready_.store(true);
+                        std::cout << "[g] Notifying \n";
+                        cv_.notify_one();
                     break;
                 case Type::WRITE:
-                    // std::cout << "[g] polled :" << request_.name() << std::endl;
+                    std::cout << "[g] polled :" << request_.name() << std::endl;
                     // received a tag on the cq, notify the main thread that we can start a new Write
-                    
                     // if(!ready_.load()){
+                    if(request_.name() == "get"){
+                        AsyncHelloRequestNextMessage();
+                    }else{
                         ready_.store(true);
-                        // std::cout << "[g] Notifying \n";
+                        std::cout << "[g] Notifying \n";
                         cv_.notify_one();
+                    }
                     // }
                 
                     break;
@@ -232,6 +238,8 @@ private:
     grpc::Status finish_status_ = grpc::Status::OK;
 
     std::atomic<uint64_t> rpc_counter_{0};
+
+    uint64_t count_ = 0;
 };
 
 int main(int argc, char** argv) {
@@ -239,13 +247,16 @@ int main(int argc, char** argv) {
         "localhost:50051", grpc::InsecureChannelCredentials()));
 
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    std::string type;
     int num;
     while (true) {
-        std::cout << "Enter number of ops (type quit to end): ";
+        std::cout << "Enter type of ops (get/put)(type quit to end): ";
+        std::cin >> type;
+        std::cout << "Enter the number of ops to perform : ";
         std::cin >> num;
         // Async RPC call that sends a message and awaits a response.
         for(int i = 0; i < num; i++){
-            if(!greeter.AsyncSayHello("hello")){
+            if(!greeter.AsyncSayHello(type)){
                 std::cout << "Quitting." << std::endl;
                 break;
             }

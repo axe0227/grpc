@@ -123,11 +123,16 @@ class CallDataBidi : CallDataBase {
         }
 
         std::cout << "thread:" << std::this_thread::get_id() << " tag:" << this << " Read a new message:" << request_.name() << std::endl;
-
-        reply_.set_message("arthur");
-        rw_.Read(&request_, (void*)this);
-
-        status_ = BidiStatus::WRITE;
+        
+        if(request_.name() == "get"){
+          reply_.set_message(request_.name());
+          rw_.Write(reply_, (void*)this);
+          status_ = BidiStatus::WRITE;
+        }else{
+          rw_.Read(&request_, (void*)this);
+          status_ = BidiStatus::READ;
+        }
+        
         break;
 
     case BidiStatus::WRITE:
